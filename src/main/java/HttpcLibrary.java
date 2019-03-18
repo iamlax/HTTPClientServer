@@ -1,22 +1,32 @@
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.BufferedReader;
 import java.io.FileReader;
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Scanner;
+import java.util.*;
+
+import static java.nio.channels.SelectionKey.OP_READ;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class HttpcLibrary {
 
     private String USER_AGENT="Mozilla/5.0";
+    private static final Logger logger = LoggerFactory.getLogger(HttpcLibrary.class);
+    private long sequenceNumberValue = 1L;
 
 
-    public String createSendRequest(String method, String URL, String file, String data, Map headers, Boolean verbose, Boolean redirect){
+    public String createSendRequest(String method, String URL, String file, String data, Map headers, Boolean verbose, Boolean redirect, SocketAddress routerAddress, InetSocketAddress serverAddress){
         URI uri;
         try{
             uri =  new URI(URL);
@@ -53,40 +63,31 @@ public class HttpcLibrary {
             request = createGetRequestString(path, query, host, headers);
         }
 
-        SocketAddress serverAddress = new InetSocketAddress(host, port);
+        try{
+            /* Setup 3-way handshaking
+                0: Data
+                1: ACK
+                2: SYN
+                3: SYN-ACK
+                4: NAK
+            */
+            Packet response1 = threeWayHandshake(routerAddress, serverAddress);
 
-        try(SocketChannel server = SocketChannel.open()) {
+            sequenceNumberValue +=1L;
+            Packet response = runClient(routerAddress, serverAddress, request, 0, sequenceNumberValue);
 
-            server.connect(serverAddress);
+            // ByteBuffer byteBufferRead = ByteBuffer.allocate(1024*1024);
 
-            Charset utf8 = StandardCharsets.UTF_8;
-            ByteBuffer byteBufferWrite = utf8.encode(request);
+            // String temp[] = utf8.decode(response).toString().split("\\r\\n\\r\\n");
+            String payload = new String(response.getPayload(), UTF_8);
 
-            server.write(byteBufferWrite);
-
-            ByteBuffer byteBufferRead = ByteBuffer.allocate(1024*1024);
-
-            for (; ; ) {
-                int nr = server.read(byteBufferRead);
-
-                if (nr == -1)
-                    break;
-
-                if (nr > 0) {
-                    byteBufferRead.flip();
-                    // server.write(byteBufferRead);
-                    byteBufferRead.clear();
-                }
-            }
-            String temp[] = utf8.decode(byteBufferRead).toString().split("\\r\\n\\r\\n");
+            String temp[] = payload.split("\\r\\n\\r\\n");
 
             responseHeader = temp[0];
             responseBody = temp[1];
 
-            server.close();
-
         } catch (Exception e) {
-            System.out.println("Error receiving response");
+            System.out.println("Error receiving response" + e);
 
         }
 
@@ -100,7 +101,7 @@ public class HttpcLibrary {
                 System.out.println("File has not been changed.");
                 return "";
             }else{
-                return createSendRequest(method, redirectLocation, file, data, headers, verbose, redirect);
+                return createSendRequest(method, redirectLocation, file, data, headers, verbose, redirect, routerAddress, serverAddress);
             }
         }
 
@@ -210,4 +211,126 @@ public class HttpcLibrary {
         return "";
     }
 
+    public Packet threeWayHandshake(SocketAddress routerAddr, InetSocketAddress serverAddr) throws IOException {
+
+        Packet response = null;
+
+        try(DatagramChannel channel = DatagramChannel.open()){
+            Packet p = new Packet.Builder()
+                    .setType(2)
+                    .setSequenceNumber(sequenceNumberValue)
+                    .setPortNumber(serverAddr.getPort())
+                    .setPeerAddress(serverAddr.getAddress())
+                    .setPayload(("").getBytes())
+                    .create();
+            channel.send(p.toBuffer(), routerAddr);
+
+            logger.info("Sending \"{}\" to router at {}", "", routerAddr);
+
+            // Try to receive a packet within timeout.
+            channel.configureBlocking(false);
+            Selector selector = Selector.open();
+            channel.register(selector, OP_READ);
+            logger.info("Waiting for the response");
+            selector.select(10000);
+
+            Set<SelectionKey> keys = selector.selectedKeys();
+
+            if(keys.isEmpty()){
+                logger.error("No response after timeout threeway");
+                // Timer timer = new Timer();
+                // timer.schedule( new threeWayHandshake(routerAddr, serverAddr, request, type, sequenceNumber), 1000);
+                threeWayHandshake(routerAddr, serverAddr);
+                // return response;
+            }
+
+            // We just want a single response.
+            ByteBuffer buf = ByteBuffer.allocate(Packet.MAX_LEN);
+            SocketAddress router = channel.receive(buf);
+            buf.flip();
+            Packet resp = Packet.fromBuffer(buf);
+            logger.info("Packet: {}", resp);
+            response = resp;
+            logger.info("Router: {}", router);
+            String payload = new String(resp.getPayload(), StandardCharsets.UTF_8);
+            logger.info("Payload: {}",  payload);
+
+            keys.clear();
+
+            if(response.getType() == 3){
+                Packet p2 = new Packet.Builder()
+                        .setType(1)
+                        .setPortNumber(serverAddr.getPort())
+                        .setPeerAddress(serverAddr.getAddress())
+                        .setPayload(("").getBytes())
+                        .create();
+                channel.send(p2.toBuffer(), routerAddr);
+                logger.info("Sending \"{}\" to router at {}", "", routerAddr);
+            } else{
+                logger.info("Received incorrect packet type {}", response.getType());
+                threeWayHandshake(routerAddr, serverAddr);
+            }
+        }
+
+        return response;
+    }
+
+    public Packet runClient(SocketAddress routerAddr, InetSocketAddress serverAddr, String request, int type, long sequenceNumber) throws IOException {
+        Packet response = null;
+
+        try(DatagramChannel channel = DatagramChannel.open()){
+            Packet p = new Packet.Builder()
+                    .setType(type)
+                    .setSequenceNumber(sequenceNumber)
+                    .setPortNumber(serverAddr.getPort())
+                    .setPeerAddress(serverAddr.getAddress())
+                    .setPayload(request.getBytes())
+                    .create();
+            channel.send(p.toBuffer(), routerAddr);
+
+            logger.info("Sending \"{}\" to router at {}", request, routerAddr);
+
+            // Try to receive a packet within timeout.
+            channel.configureBlocking(false);
+            Selector selector = Selector.open();
+            channel.register(selector, OP_READ);
+            logger.info("Waiting for the response");
+            selector.select(5000);
+
+            Set<SelectionKey> keys = selector.selectedKeys();
+
+            if(keys.isEmpty()){
+                logger.error("No response after timeout run client");
+                // Timer timer = new Timer();
+                // timer.schedule( new resendPacket(routerAddr, serverAddr, request, type, sequenceNumber), 1000);
+                runClient(routerAddr, serverAddr, request, type, sequenceNumber);
+                // return response;
+            }
+
+            // We just want a single response.
+            ByteBuffer buf = ByteBuffer.allocate(Packet.MAX_LEN);
+            SocketAddress router = channel.receive(buf);
+            buf.flip();
+            Packet resp = Packet.fromBuffer(buf);
+            logger.info("Packet: {}", resp);
+            response = resp;
+            logger.info("Router: {}", router);
+            String payload = new String(resp.getPayload(), StandardCharsets.UTF_8);
+            logger.info("Payload: {}",  payload);
+
+
+            Packet p2 = new Packet.Builder()
+                    .setType(1)
+                    .setSequenceNumber(sequenceNumber)
+                    .setPortNumber(serverAddr.getPort())
+                    .setPeerAddress(serverAddr.getAddress())
+                    .setPayload(("").getBytes())
+                    .create();
+            channel.send(p2.toBuffer(), routerAddr);
+
+            keys.clear();
+        }
+
+        return response;
+    }
 }

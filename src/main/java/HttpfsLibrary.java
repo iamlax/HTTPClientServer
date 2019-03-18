@@ -2,32 +2,40 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.*;
 import java.util.concurrent.ForkJoinPool;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class HttpfsLibrary {
 
     private static final Logger logger = LoggerFactory.getLogger(HttpfsLibrary.class);
+    private long sequenceNumberValue = 1L;
+    // private Timer timer = new Timer();
 
-    public String display(ByteBuffer x, File folder){
-        Charset utf8 = StandardCharsets.UTF_8;
+    public String display(String x, File folder){
         String requestFile;
-        String input = utf8.decode(x).toString();
+        String input = x;
 
         String message[] = input.split("\r\n\r\n");
-        String header = message[0];
+        String header = (message.length>0? message[0] : "");
         String body = (message.length>1? message[1] : "");
 
         String request[] = header.split("\r\n")[0].split(" ");
-        String response = "";
+        String method = (request.length>0? request[0] : "");
 
-        if(request[0].equalsIgnoreCase("get")){
+        String response = "";
+        if(method.equalsIgnoreCase("get")){
 
             String requestIgnoreQuery = request[1].substring(0, request[1].lastIndexOf("?"));
 
@@ -52,7 +60,7 @@ public class HttpfsLibrary {
                 }
             }
 
-        }else if(request[0].equalsIgnoreCase("post")){
+        }else if(method.equalsIgnoreCase("post")){
 
             String requestIgnoreQuery = request[1];
 
@@ -81,46 +89,233 @@ public class HttpfsLibrary {
         return response;
     }
 
-    public void readRequestAndRepeat(SocketChannel socket, String dir) {
-        try (SocketChannel client = socket) {
-            ByteBuffer buf = ByteBuffer.allocate(1024);
+    public void readRequestAndRepeat(DatagramChannel socket, String dir) {
+
+
+        try (DatagramChannel client = socket) {
+            ByteBuffer buf = ByteBuffer
+                    .allocate(Packet.MAX_LEN)
+                    .order(ByteOrder.BIG_ENDIAN);
+
             for (; ; ) {
-                int nr = client.read(buf);
+                SocketAddress router;
+                Packet packet;
 
-                if (nr == -1)
-                    break;
+                /* Setup 3-way handshaking
+                    0: Data
+                    1: ACK
+                    2: SYN
+                    3: SYN-ACK
+                    4: NAK
+                */
 
-                if (nr > 0) {
-                    // ByteBuffer is tricky, you have to flip when switch from read to write, or vice-versa
-                    buf.flip();
-
+                buf.clear();
+                router = client.receive(buf);
+                buf.flip();
+                packet = Packet.fromBuffer(buf);
+                buf.flip();
+                if(packet.getSequenceNumber() == (sequenceNumberValue+1L)){
+                    sequenceNumberValue+=1;
+                    String payload = new String(packet.getPayload(), UTF_8);
+                    logger.info("Packet: {}", packet);
+                    logger.info("Payload: {}", payload);
+                    logger.info("Router: {}", router);
                     File folder = new File(dir);
-                    Charset utf8 = StandardCharsets.UTF_8;
+                    String response = display(payload, folder);
 
-                    String response = display(buf.duplicate(), folder);
-                    ByteBuffer byteBufferWrite = utf8.encode(response);
-                    client.write(byteBufferWrite);
-                    byteBufferWrite.clear();
-
-                    buf.flip();
-                    buf.clear();
-                    break;
+                    selectiveRepeat(socket, dir, packet, router, response);
                 }
+
             }
+
         } catch (IOException e) {
             logger.error("Echo error {}", e);
         }
     }
 
-    public void listenAndServe(int port, String dir) throws IOException {
-        try (ServerSocketChannel server = ServerSocketChannel.open()) {
-            server.bind(new InetSocketAddress(port));
-            logger.info("HttpfsLibrary is listening at {}", server.getLocalAddress());
+    public void threeWayHandshake(DatagramChannel socket, String dir) {
+
+        try (DatagramChannel client = socket) {
+            ByteBuffer buf = ByteBuffer
+                    .allocate(Packet.MAX_LEN)
+                    .order(ByteOrder.BIG_ENDIAN);
+
             for (; ; ) {
-                SocketChannel client = server.accept();
-                logger.info("New client from {}", client.getRemoteAddress());
-                ForkJoinPool.commonPool().submit(() -> readRequestAndRepeat(client, dir));
+                SocketAddress router;
+                Packet packet;
+
+                /* Setup 3-way handshaking
+                    0: Data
+                    1: ACK
+                    2: SYN
+                    3: SYN-ACK
+                    4: NAK
+                */
+                while(true){
+                    buf.clear();
+                    router = client.receive(buf);
+                    buf.flip();
+                    packet = Packet.fromBuffer(buf);
+                    buf.flip();
+                    if(packet.getType() == 2){
+                        sequenceNumberValue = packet.getSequenceNumber();
+                        Packet resp = packet.toBuilder()
+                                .setType(3)
+                                .setPayload(("").getBytes())
+                                .create();
+                        client.send(resp.toBuffer(), router);
+                        buf.clear();
+                        break;
+                    } else {
+                        logger.info("Received incorrect packet type {}", packet.getType());
+                        return;
+                    }
+                }
+
+                Timer timer = new Timer();
+                timer.schedule( new threeWay(socket, dir), 1000);
+
+                while(true){
+                    buf.clear();
+                    client.receive(buf);
+                    buf.flip();
+                    packet = Packet.fromBuffer(buf);
+                    buf.flip();
+                    if(packet.getType() == 1){
+                        timer.cancel();
+                        buf.clear();
+                        break;
+                    }
+                }
+                readRequestAndRepeat(socket, dir);
+                // ForkJoinPool.commonPool().submit(() -> readRequestAndRepeat(socket, dir));
             }
+
+        } catch (IOException e) {
+            logger.error("Echo error {}", e);
+        }
+    }
+
+    public void selectiveRepeat(DatagramChannel socket, String dir, Packet pack, SocketAddress route, String respon) {
+
+        try (DatagramChannel client = socket) {
+            ByteBuffer buf = ByteBuffer
+                    .allocate(Packet.MAX_LEN)
+                    .order(ByteOrder.BIG_ENDIAN);
+
+            for (; ; ) {
+                SocketAddress router = route;
+                Packet packet = pack;
+
+                /* Setup 3-way handshaking
+                    0: Data
+                    1: ACK
+                    2: SYN
+                    3: SYN-ACK
+                    4: NAK
+                */
+
+                String response = respon;
+                Charset utf8 = StandardCharsets.UTF_8;
+                ByteBuffer byteBufferWrite = utf8.encode(response);
+                Packet resp = packet.toBuilder()
+                        .setType(0)
+                        .setSequenceNumber(sequenceNumberValue)
+                        .setPayload(byteBufferWrite.array())
+                        .create();
+                client.send(resp.toBuffer(), router);
+                buf.clear();
+
+                Timer timer = new Timer();
+                timer.schedule( new resendPacket(socket, dir, packet, router, response), 1000);
+
+                while(true){
+                    buf.clear();
+                    client.receive(buf);
+                    buf.flip();
+                    packet = Packet.fromBuffer(buf);
+                    buf.flip();
+
+                    if(packet.getType() == 1 && packet.getSequenceNumber() == sequenceNumberValue){
+
+                        buf.clear();
+                        timer.cancel();
+                        break;
+                    }
+                }
+                threeWayHandshake(socket, dir);
+                // ForkJoinPool.commonPool().submit(() -> readRequestAndRepeat(socket, dir));
+
+            }
+
+        } catch (IOException e) {
+            logger.error("Echo error {}", e);
+        }
+    }
+
+    class resendPacket extends TimerTask {
+
+        private DatagramChannel socket;
+        private String dir;
+        private String response;
+        private Packet packet;
+        private SocketAddress router;
+
+        resendPacket(DatagramChannel socket, String dir, Packet packet, SocketAddress router, String response){
+            this.socket = socket;
+            this.dir = dir;
+            this.packet = packet;
+            this.router = router;
+            this.response = response;
+        }
+
+        public void run() {
+            selectiveRepeat(socket, dir, packet, router, response);
+        }
+    }
+
+    class threeWay extends TimerTask {
+
+        private DatagramChannel socket;
+        private String dir;
+
+        threeWay(DatagramChannel socket, String dir){
+            this.socket = socket;
+            this.dir = dir;
+        }
+
+        public void run() {
+            threeWayHandshake(socket, dir);
+        }
+    }
+
+    public Packet createPacket(ByteBuffer buf, int type, long sequenceNumber, String payload){
+
+        Packet packet;
+        Packet response = null;
+
+        try{
+            packet = Packet.fromBuffer(buf);
+            response = packet.toBuilder()
+                    .setType(type)
+                    .setSequenceNumber(sequenceNumber)
+                    .setPayload(payload.getBytes())
+                    .create();
+        }catch(Exception e){
+
+        }
+        return response;
+    }
+
+    public void listenAndServe(int port, String dir) throws IOException {
+        try (DatagramChannel channel = DatagramChannel.open()) {
+            channel.bind(new InetSocketAddress(port));
+            logger.info("HttpfsLibrary is listening at {}", channel.getLocalAddress());
+            logger.info("New client from {}", channel.getRemoteAddress());
+            threeWayHandshake(channel, dir);
+            // readRequestAndRepeat(channel, dir);
+        } catch (Exception e) {
+            logger.error("Echo error {}", e);
         }
     }
 
@@ -207,7 +402,6 @@ public class HttpfsLibrary {
                     tempFile = file;
                 }
             }
-
         }
 
         return tempFile;

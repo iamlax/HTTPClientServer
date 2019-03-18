@@ -24,6 +24,22 @@ public class httpc {
         parser.accepts("r", "Allow redirect.").withOptionalArg();
         parser.accepts("o", "Associates the content of a file to the body HTTP POST request.").withRequiredArg();
 
+        parser.accepts("router-host", "Router hostname")
+                .withOptionalArg()
+                .defaultsTo("localhost");
+
+        parser.accepts("router-port", "Router port number")
+                .withOptionalArg()
+                .defaultsTo("3000");
+
+        parser.accepts("server-host", "EchoServer hostname")
+                .withOptionalArg()
+                .defaultsTo("localhost");
+
+        parser.accepts("server-port", "EchoServer listening port")
+                .withOptionalArg()
+                .defaultsTo("8007");
+
         OptionSet opts = parser.parse(args);
 
         if (args.length < 1){
@@ -113,11 +129,29 @@ public class httpc {
             }
 
             HttpcLibrary httpcLibrary = new HttpcLibrary();
-            String response = httpcLibrary.createSendRequest(method, URL, file, data, headers, verbose, redirect);
+
+
+            // Router address
+            String routerHost = (String) opts.valueOf("router-host");
+            int routerPort = Integer.parseInt((String) opts.valueOf("router-port"));
+
+            // Server address
+            String serverHost = (String) opts.valueOf("server-host");
+            int serverPort = Integer.parseInt((String) opts.valueOf("server-port"));
+
+            SocketAddress routerAddress = new InetSocketAddress(routerHost, routerPort);
+            InetSocketAddress serverAddress = new InetSocketAddress(serverHost, serverPort);
+            String response="";
+            try {
+                response = httpcLibrary.createSendRequest(method, URL, file, data, headers, verbose, redirect, routerAddress, serverAddress);
+
+            }catch (Exception e){
+                System.out.println("There was an calling run client");
+            }
+
             Writer writer=null;
             if(!outputFile.isEmpty()){
                 try {
-
                     writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outputFile), "utf-8"));
                     writer.write(response);
                 }catch (Exception e){
@@ -129,8 +163,7 @@ public class httpc {
 
                     }
                 }
-            }else
-            {
+            }else {
                 System.out.println(response);
             }
 
