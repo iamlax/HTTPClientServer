@@ -117,6 +117,7 @@ public class httpc {
             Writer writer=null;
             if(!outputFile.isEmpty()){
                 try {
+
                     writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outputFile), "utf-8"));
                     writer.write(response);
                 }catch (Exception e){
@@ -132,6 +133,7 @@ public class httpc {
             {
                 System.out.println(response);
             }
+
         }
 
     }
@@ -149,6 +151,7 @@ public class httpc {
                 headers.put(key, value);
             }
         }
+
         return headers;
     }
 }

@@ -73,9 +73,8 @@ public class HttpcLibrary {
                     break;
 
                 if (nr > 0) {
-
                     byteBufferRead.flip();
-                    server.write(byteBufferRead);
+                    // server.write(byteBufferRead);
                     byteBufferRead.clear();
                 }
             }
